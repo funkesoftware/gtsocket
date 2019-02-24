@@ -1,0 +1,97 @@
+#!/usr/bin/python
+from __future__ import print_function # python 2 compatibility
+
+"""Receive and/or send commands to radio controlled sockets (model GT-FSI-11) from brand 'Globaltronics'. Demo script."""
+"""
+    Copyright (C) 2018  Markus Funke
+
+    This program is free software: you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+"""
+
+import sys
+import argparse
+import time
+from _functools import partial
+import signal as signal_module
+import gtsocket
+
+#AVAILABLE_SOCKETS = ['A', 'B']
+AVAILABLE_SOCKETS = [section.split(':')[1] for section in gtsocket.config.sections() if section.split(':')[0] == 'socket']
+AVAILABLE_COMMANDS = ['on', 'off']
+            
+def print_received_signal_sequence(signal_sequence, encoding):
+    print(signal_sequence)
+    
+def print_received_command(socket, command):
+    print("Received command", command, "for socket", socket.get_name())
+    
+def stop_receiving(sockets, signal, frame):
+    for socket in sockets:
+        socket.stop_receiving()
+        socket.receiving_thread.join()
+        print('**Stopped receiving for socket ' + socket.get_name() + '**')
+    gtsocket.clear_GPIOs()
+    sys.exit(0)
+
+if __name__ == '__main__':
+    argparser = argparse.ArgumentParser(description='Send/Receive commands to/from Globaltronics/EasyHome radio controlled sockets.')
+    argparser.add_argument('-m', '--mode', choices=['receive','send'], help='Mode: receiving or sending', required=True)
+    argparser.add_argument('-s', '--socket', choices=AVAILABLE_SOCKETS, help='The socket to send the command to / receive the commands/signals from.')
+    argparser.add_argument('-c', '--command', choices=AVAILABLE_COMMANDS, help='The command to send/receive.')
+    argparser.add_argument('-r', '--receive-mode', choices=['signals','commands'], help='What to receive/output: Raw signals or parsed commands. Default: commands', default='commands')
+    argparser.add_argument('-t', '--time', type=int, help='How long to listen for signals/commands (in seconds). Default: 0=infinitely', default=0)
+    args = argparser.parse_args()
+    
+    if args.mode == 'receive':
+        socket_names = [args.socket] if args.socket is not None else AVAILABLE_SOCKETS
+        commands = [args.command] if args.command is not None else AVAILABLE_COMMANDS
+        
+        gtsocket.initialize_GPIOs()
+        
+        sockets = []
+        
+        for socket_name in socket_names:
+            socket = gtsocket.Socket(socket_name)
+            sockets.append(socket)
+            
+            if args.receive_mode == 'signals':
+                socket.add_signal_handler(print_received_signal_sequence)
+            else:
+                socket.add_command_handler(print_received_command)
+            socket.start_receiving()
+            print('**Started receiving for socket ' + socket_name + '**')
+            
+        signal_module.signal(signal_module.SIGTERM, partial(stop_receiving, sockets))
+        signal_module.signal(signal_module.SIGINT, partial(stop_receiving, sockets))
+        
+        if args.time > 0:
+            time.sleep(args.time)
+            stop_receiving(sockets, None, None)
+        else:
+            signal_module.pause()
+                
+    elif args.mode == 'send':
+        if args.socket is not None:
+            if args.command is not None:
+                gtsocket.initialize_GPIOs()
+                socket = gtsocket.Socket(args.socket)
+                print('**Started sending**')
+                socket.send_command(args.command)
+                print('**Ended sending**')
+                gtsocket.clear_GPIOs()
+            else:
+                print('Please specify the command you want to send.')
+        else:
+            print('Please specify the socket you want to send the command to.')
+    

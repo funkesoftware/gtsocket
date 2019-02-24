@@ -1,0 +1,353 @@
+#!python
+from __future__ import print_function # python 2 compatibility
+from builtins import input # python 2 compatibility
+
+"""This script provides a wizard to create a hardware specific config in ~/.gtsocket/config.ini."""
+"""
+    Copyright (C) 2018  Markus Funke
+
+    This program is free software: you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+"""
+
+import os
+import argparse
+
+try:
+    from configparser import ConfigParser
+except ImportError:
+    from ConfigParser import SafeConfigParser as ConfigParser
+
+from datetime import datetime
+from RPi import GPIO
+import gtsocket
+
+SIGNAL_RECEIVE_TIME = 3 # in seconds
+
+DEFAULT_CONFIG = gtsocket.config
+
+NEW_CONFIG_FILE = os.path.expanduser('~/.gtsocket/config.ini')
+
+if not os.path.isdir(os.path.dirname(NEW_CONFIG_FILE)):
+    os.mkdir(os.path.dirname(NEW_CONFIG_FILE))
+    open(NEW_CONFIG_FILE, 'a').close() # create local config file, if it does not yet exist
+    print('Local config did not exist. It was created as:', NEW_CONFIG_FILE)
+
+new_config = ConfigParser({})
+new_config.read([NEW_CONFIG_FILE])
+
+receiving_pin = int(new_config.get('general', 'receiving_GPIO_pin')) if new_config.has_option('general', 'receiving_GPIO_pin') else None
+if receiving_pin is None and DEFAULT_CONFIG.has_option('general', 'receiving_GPIO_pin'):
+    receiving_pin = int(DEFAULT_CONFIG.get('general', 'receiving_GPIO_pin'))
+
+sending_pin = int(new_config.get('general', 'sending_GPIO_pin')) if new_config.has_option('general', 'sending_GPIO_pin') else None
+if sending_pin is None and DEFAULT_CONFIG.has_option('general', 'sending_GPIO_pin'):
+    sending_pin = int(DEFAULT_CONFIG.get('general', 'sending_GPIO_pin'))
+    
+available_groups = [section.split(':')[1] for section in new_config.sections() if section.split(':')[0] == 'group']
+if len(available_groups) == 0:
+    available_groups = [section.split(':')[1] for section in DEFAULT_CONFIG.sections() if section.split(':')[0] == 'group']
+default_group_name = available_groups[0] if len(available_groups) == 1 else '1'
+
+def receive_signals(receiving_seconds, allowed_signals = []):
+    """Receive signals on 433Mhz and return a list of signals types and sequence of signals received."""
+    allowed_signals = [int(signal) for signal in allowed_signals]
+    
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setup(receiving_pin, GPIO.IN)
+    allowed_signals_given = len(allowed_signals)
+    cumulative_seconds = 0
+    scan_start_time = start_time = time_now = datetime.now()
+    last_value = None
+    
+    received_signal_indices = []
+    
+    while (time_now - scan_start_time).seconds < receiving_seconds:
+        value_now = GPIO.input(receiving_pin)
+        time_now = datetime.now()
+        if value_now != last_value:
+            if last_value is not None:
+                time_delta = time_now - start_time
+                microsec_delta = int(round(time_delta.microseconds + (time_delta.seconds * 1000000), -2))
+                if microsec_delta == 0: continue
+                if value_now != 0: microsec_delta *= -1;
+
+                if allowed_signals_given:
+                    best_difference = best_index = None
+                    for index, signal in enumerate(allowed_signals):
+                        difference = abs(microsec_delta - signal)
+                        if best_difference is None or difference < best_difference:
+                            best_difference = difference
+                            best_index = index
+                    signal_index = best_index
+                else:
+                    if microsec_delta in allowed_signals:
+                        signal_index = allowed_signals.index(microsec_delta)
+                    else:
+                        allowed_signals.append(microsec_delta)
+                        signal_index = len(allowed_signals) - 1;
+
+                received_signal_indices.append(signal_index)
+            last_value = value_now
+            start_time = time_now
+    GPIO.cleanup()
+    
+    return (allowed_signals, received_signal_indices)
+
+def get_signals_by_indices(indices, allowed_signals):
+    """Get signals (how long off or on) by given indices in allowed_signals list."""
+    return [allowed_signals[index] for index in indices]
+
+def print_signal_definitions(allowed_signals):
+    """Print legend of given signals types and their indices."""
+    definitions = ''
+    for index, signal in enumerate(allowed_signals):
+        if definitions != '': definitions += ', '
+        definitions += 'P(' + format(index, 'x') + ')=' + str(signal)
+    print(definitions)
+
+def print_signal_indices(signals_indices, separator = ''):
+    """Print list of indices of received signals as string separated by given separator."""
+    print("Received signals:", separator.join(format(x, 'x') for x in signals_indices))
+
+if __name__ == '__main__':
+    AVAILABLE_STEPS = ['pins','encodings','sequences']
+    
+    argparser = argparse.ArgumentParser(description='Setup config for gtsocket.')
+    argparser.add_argument('-s', '--step', choices=AVAILABLE_STEPS, help='Which part of config to create. Default: pins (first part).', default='pins')
+    args = argparser.parse_args()
+    
+    current_step = args.step
+    
+    group_name = None
+    allowed_signals = []
+    while current_step in AVAILABLE_STEPS:
+        if group_name is None:
+            group_name = input('Please specify the name of the socket group / remote you want to configure [{}]:'.format(default_group_name)).strip()
+            if group_name == '':
+                group_name = default_group_name
+        
+        if current_step == 'pins':
+            # Ask for the Raspberry Pi GPIO pins to which 433Mhz sender and receiver are connected.
+            try:
+                if not new_config.has_section('general'): new_config.add_section('general')
+                pin_string = input('To which GPIO pin is the RECEIVER connected (BCM numbering)? [{}]: '.format(receiving_pin)).strip()
+                if pin_string != '':
+                    receiving_pin = int(pin_string)
+                new_config.set('general', 'receiving_GPIO_pin', str(receiving_pin))
+                print('New receiving pin is', receiving_pin)
+                
+                pin_string = input('To which GPIO pin is the SENDER connected (BCM numbering)? [{}]: '.format(sending_pin)).strip()
+                if pin_string != '':
+                    sending_pin = int(pin_string)
+                new_config.set('general', 'sending_GPIO_pin', str(sending_pin))
+                print('New sending pin is', sending_pin)
+                
+                current_step = 'encodings'
+            except:
+                #raise
+                print('The pin number you entered is not a valid number. Please try again.')
+                current_step = 'stop'
+        elif current_step == 'encodings':
+            # Determine the (two) encodings the remote sends commands with. Which type and sequence of signals is binary 1, binary 0 and init sequence?
+            group_encoding_names = new_config.get('group:' + group_name, 'encodings').split(',') if new_config.has_option('group:' + group_name, 'encodings') else None
+            if group_encoding_names is None:
+                group_encoding_names = DEFAULT_CONFIG.get('group:' + group_name, 'encodings').split(',') if DEFAULT_CONFIG.has_option('group:' + group_name, 'encodings') else None
+            
+            input('Please press and hold any key on your remote and hit Enter...')
+            print('Will listen for signals now. Please wait {} sec.'.format(SIGNAL_RECEIVE_TIME))
+            allowed_signals, received_signal_indices = receive_signals(SIGNAL_RECEIVE_TIME)
+            print_signal_definitions(allowed_signals)
+            separator = '.' if len(allowed_signals) > 16 else ''
+            print_signal_indices(received_signal_indices, separator)
+            
+            try:
+                rescan = True
+                while rescan:
+                    confirmed_signal_hex_indices = input('Please enter those signal indices you want to keep (comma-separated) (empty to keep all):').strip().split(',')
+                    if len(confirmed_signal_hex_indices) > 1:
+                        new_allowed_signals = []
+                        for signal_hex_index in confirmed_signal_hex_indices:
+                            new_allowed_signals.append(allowed_signals[int(signal_hex_index, 16)])
+                        input('Repeating with given signals. Please press and hold any key on your remote and hit Enter...')
+                        allowed_signals, received_signal_indices = receive_signals(SIGNAL_RECEIVE_TIME, new_allowed_signals)
+                        print_signal_definitions(allowed_signals)
+                        separator = '.' if len(allowed_signals) > 16 else ''
+                        print_signal_indices(received_signal_indices, separator)
+                    else:
+                        rescan = False
+                        
+                encoding_index = 0
+                new_group_encoding_names = []
+                while encoding_index >= 0:
+                    default_encoding_name = group_encoding_names[encoding_index] if len(group_encoding_names) > encoding_index else ''
+                    encoding_name = input('Please specify a name for encoding {} (\'s\' to stop) [{}]'.format(encoding_index, default_encoding_name)).strip()
+                    if encoding_name == '':
+                        encoding_name = default_encoding_name
+                    
+                    if encoding_name != 's':
+                        section = 'encoding:' + encoding_name
+                        if not new_config.has_section(section): new_config.add_section(section)
+                        
+                        for name in ['init', '1', '0']:
+                            display_name = 'binary value ' + name if name == '1' or name == '0' else name
+                            
+                            default_signals = new_config.get(section, name).split(',') if new_config.has_option(section, name) else None
+                            if default_signals is None:
+                                default_signals = DEFAULT_CONFIG.get(section, name).split(',') if DEFAULT_CONFIG.has_option(section, name) else []
+                            
+                            default_signals_recognized = False
+                            display_value = ''
+                            if len(default_signals) > 0:
+                                try:
+                                    display_value = [format(allowed_signals.index(signal), 'x') for signal in default_signals]
+                                    default_signals_recognized = True
+                                except ValueError:
+                                    pass
+                                
+                            new_value_str = input('Please enter {} sequence of encoding {} (comma-separated) {}:'.format(display_name, encoding_name, display_value)).strip()
+                            if new_value_str != '' or not default_signals_recognized:
+                                if len(new_value_str.split(',')) == 2:
+                                    new_value = [allowed_signals[int(hex_index, 16)] for hex_index in new_value_str.split(',')]
+                                else:
+                                    new_value = default_signals
+                                    print('{} sequence was not updated. It must be 2 signals long.'.format(display_name))
+                            else:
+                                new_value = default_signals
+                                
+                            new_value_str = ','.join(str(signal) for signal in new_value)
+                            new_config.set(section, name, new_value_str)
+                        
+                        new_group_encoding_names.append(encoding_name)
+                        encoding_index += 1
+                    else:
+                        encoding_index = -1
+                        
+                if not new_config.has_section('group:' + group_name):
+                    new_config.add_section('group:' + group_name)
+                new_config.set('group:' + group_name, 'encodings', ','.join(new_group_encoding_names))
+            except:
+                raise
+            
+            current_step = 'sequences'
+        elif current_step == 'sequences':
+            # Determine which data (sequences of 1s and 0s) is send for each socket and command.
+            group_encoding_names = new_config.get('group:' + group_name, 'encodings').split(',') if new_config.has_option('group:' + group_name, 'encodings') else None
+            if group_encoding_names is None:
+                group_encoding_names = DEFAULT_CONFIG.get('group:' + group_name, 'encodings').split(',') if DEFAULT_CONFIG.has_option('group:' + group_name, 'encodings') else None
+                
+            start_data = new_config.get('group:' + group_name, 'start_data') if new_config.has_option('group:' + group_name, 'start_data') else DEFAULT_CONFIG.get('group:' + group_name, 'start_data')
+            
+            encodings = []
+            if len(allowed_signals) == 0:
+                if group_encoding_names is not None:
+                    for encoding_name in group_encoding_names:
+                        encoding = {}
+                        encoding_values = new_config.items('encoding:' + encoding_name) if new_config.has_section('encoding:' + encoding_name) else DEFAULT_CONFIG.items('encoding:' + encoding_name)
+                        for name, signals in encoding_values:
+                            allowed_signals += signals.split(',')
+                            encoding[name] = [int(signal) for signal in signals.split(',')]
+                        encodings.append(encoding)
+                    allowed_signals = list(set(allowed_signals))
+                else:
+                    current_step = 'stop'
+                    break
+                                
+            new_start_data = None
+            new_end_data = {}
+            end_data = {}
+            command_data = {}
+            while True:
+                socket_name = input('\nPlease specify the name of the socket you want to configure (empty to stop):').strip()
+                if socket_name != '':
+                    if not new_config.has_section('socket:' + socket_name):
+                        new_config.add_section('socket:' + socket_name)
+                    new_config.set('socket:' + socket_name, 'group', group_name)
+                    
+                    if socket_name not in new_end_data:
+                        new_end_data[socket_name] = None
+                    end_data[socket_name] = new_config.get('socket:' + socket_name, 'end_data') if new_config.has_option('socket:' + socket_name, 'end_data') else DEFAULT_CONFIG.get('socket:' + socket_name, 'end_data')
+                    command_data[socket_name] = {}
+                    command_data[socket_name]['on'] = new_config.get('socket:' + socket_name, 'on_command_data') if new_config.has_option('socket:' + socket_name, 'on_command_data') else DEFAULT_CONFIG.get('socket:' + socket_name, 'on_command_data')
+                    command_data[socket_name]['off'] = new_config.get('socket:' + socket_name, 'off_command_data') if new_config.has_option('socket:' + socket_name, 'off_command_data') else DEFAULT_CONFIG.get('socket:' + socket_name, 'off_command_data')
+                    
+                    command = ''
+                    while command != 'on' and command != 'off':
+                        command = input('Please specify the command of that socket you want to configure (on or off):').strip()
+                    
+                    input('Please press and hold the corresponding button on your remote and hit Enter...')
+                    allowed_signals, received_signal_indices = receive_signals(SIGNAL_RECEIVE_TIME, allowed_signals)
+                    received_signals = get_signals_by_indices(received_signal_indices, allowed_signals)
+                    
+                    start = 0
+                    while (start + 2) < len(received_signals):
+                        current_encoding = None
+                        for encoding in encodings:
+                            if received_signals[start:start+2] == encoding['init']:
+                                current_encoding = encoding
+                                start += 2
+                        if current_encoding is not None:
+                            data_sequence = ''
+                            while (start + 2) < len(received_signals):
+                                if received_signals[start:start+2] == current_encoding['0']:
+                                    data_sequence += '0'
+                                elif received_signals[start:start+2] == current_encoding['1']:
+                                    data_sequence += '1'
+                                else:
+                                    if len(data_sequence) > 6:
+                                        data_sequence = data_sequence[:4] + '-' + data_sequence[4:]
+                                        if len(data_sequence) > 9:
+                                            data_sequence = data_sequence[:-4] + '-' + data_sequence[-4:]
+                                        print(data_sequence)
+                                    break
+                                start += 2
+                        else:
+                            start += 1
+                            
+                    if new_start_data is None:
+                        print('\nStart data is the data sequence at the beginning of each command (separated by first dash) which should be identical for all commands and sockets.')
+                        new_start_data = input('Please enter start data: [{}]'.format(start_data)).strip()
+                        if new_start_data == '':
+                            new_start_data = start_data
+                        if not new_config.has_section('group:' + group_name): new_config.add_section('group:' + group_name)
+                        new_config.set('group:' + group_name, 'start_data', new_start_data)
+                        start_data = new_start_data
+                        
+                    if new_end_data[socket_name] is None:
+                        print('\nEnd data is the data sequence at the end of each command (separated by second dash) which should be the same for all commands for a given socket but different for each socket.')
+                        new_end_data[socket_name] = input('Please enter end data for socket >>{}<<: [{}]'.format(socket_name, end_data[socket_name])).strip()
+                        if new_end_data[socket_name] == '':
+                            new_end_data[socket_name] = end_data[socket_name]
+                            
+                        new_config.set('socket:' + socket_name, 'end_data', new_end_data[socket_name])
+                        end_data[socket_name] = new_end_data[socket_name]
+                        
+                    print('\nA data sequence is the part after the start and before the end sequence (between the two dashes).\nThere should be four different data sequences for each socket-command combination.')
+                    print('Data sequences may be (and probably are) the same for different socket-command combinations.\nInstead of the list of data sequences you can give the socket-command combination in that case. For example: \'socket:C|off_command_data\'')
+                    new_command_data = input('Please enter data sequences for button >>{} {}<< (comma-separated): [{}]'.format(socket_name, command, command_data[socket_name][command])).strip()
+                    if new_command_data == '':
+                        new_command_data = command_data[socket_name][command]
+                        
+                    new_config.set('socket:' + socket_name, command + '_command_data', new_command_data)
+                    command_data[socket_name][command] = new_command_data
+                else:
+                    break
+                    
+            current_step = 'stop'
+            
+        with open(NEW_CONFIG_FILE, 'w') as cfgfile:
+            new_config.write(cfgfile)
+            print('\nLocal config file has been updated.')
+            
+    print('\nSetup complete. You can now use gtsocket-test script to send and receive test commands.')
+    

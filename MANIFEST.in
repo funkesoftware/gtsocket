@@ -1,0 +1,4 @@
+include README.md
+include gtsocket/gtsocket.cfg
+include bin/gtsocket-setup
+include bin/gtsocket-test
